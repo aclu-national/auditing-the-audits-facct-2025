@@ -1,0 +1,853 @@
+---
+title: "Replication of paper results for Gerchick et al. Auditing the Audits FAccT 2025 Paper"
+output:
+  html_document: 
+    toc: true
+    toc_depth: 2
+    code_folding: show
+    message_folding: show
+    theme: cosmo
+    highlight: tango
+  pdf_document: default
+date: '2025-05-12'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(fig.width = 10)
+
+fig_ht_sex <- 3
+fig_ht_race <- 2.5*fig_ht_sex
+
+## LOAD LIBRARIES HERE
+library(purrr)
+library(tidyr)
+library(tidyverse)
+library(ggplot2)
+library(kableExtra)
+library(forcats)
+library(janitor)
+library(here)
+library(tidylog)
+library(viridisLite)
+library(cowplot)
+
+## Source helper script, read in cleaned and joined audit data
+source(here::here("code/helpers.R"))
+aedt_df <- read_csv(here::here("audits/audits_full.csv"))
+```
+
+This document includes analysis and results from [*Auditing the Audits: Lessons for Algorithmic Accountability from Local Law 144’s Bias Audits*](https://doi.org/10.1145/3715275.3732004), published at FAccT 2025. 
+
+## Section 4 Results: Summary Statistics
+
+0. Number of audit reports, audits, deploying entities, year repeats (Table 1 results)
+
+```{r section-4-0-1}
+num_audit_reports <- aedt_df %>% 
+  select(audit_report_id) %>% 
+  n_distinct()
+
+num_audits <- aedt_df %>% 
+  select(audit_id) %>% 
+  n_distinct()
+
+num_deploying_entities <- aedt_df %>% 
+  select(deploying_entity) %>% 
+  n_distinct()
+
+num_tool_vendors <- aedt_df %>%
+  select(tool_vendor) %>%
+  n_distinct()
+
+num_audit_reports_multi_year <- aedt_df %>%
+  select(deploying_entity, tool_id, position, year_of_audit_result) %>%
+  distinct() %>%
+  mutate(has_val = "yes") %>%
+  pivot_wider(names_from = year_of_audit_result, values_from = has_val) %>%
+  filter(`2023` == "yes" & `2024` == "yes") %>%
+  select(-position, -tool_id) %>%
+  distinct() %>%
+  nrow()
+
+num_audits_multi_year <- aedt_df %>%
+  select(deploying_entity, tool_id, position, year_of_audit_result) %>%
+  distinct() %>%
+  mutate(has_val = "yes") %>%
+  pivot_wider(names_from = year_of_audit_result, values_from = has_val) %>%
+  filter(`2023` == "yes" & `2024` == "yes") %>%
+  select(-position) %>%
+  distinct() %>%
+  nrow()
+
+tribble(
+  ~ "Unit", ~ "Count",
+  "audit reports", num_audit_reports,
+  "audits", num_audits,
+  "tool vendors", num_tool_vendors,
+  "deploying entities", num_deploying_entities,
+  "audit reports multi-year", num_audit_reports_multi_year,
+  "audits multi-year", num_audits_multi_year
+)
+```
+
+1. Popularity of particular auditors (Table 1 caption)
+
+- Most popular auditors in our sample were Holistic AI, DCI Consulting Group, BABL AI, and Conductor AI.
+
+```{r section-4-0-2}
+auditor_breakdown <- aedt_df %>%
+  select(audit_report_id, auditor, deploying_entity, tool_vendor) %>%
+  distinct()
+
+auditor_breakdown %>%
+  tabyl(auditor) %>%
+  arrange(-n)
+```
+
+## Section 4.1 Results: Historical Data, Test Data and Data Pooling
+
+```{r section-4-1}
+data_type_summary <- aedt_df %>%
+  select(audit_id, audit_report_id, data_type) %>% 
+  distinct() %>%
+  group_by(audit_report_id) %>%
+  mutate(report_data_type = case_when(
+    all(data_type == "historical") ~ "All historical",
+    all(data_type == "test") ~ "All test",
+    all(data_type == "Unknown") ~ "All Unknown",
+    TRUE ~ "Mixed"
+  )) %>%
+  ungroup()
+
+# All audit reports use only one type of data (historical, test, or unknown)
+stopifnot(
+  data_type_summary$report_data_type %>% str_detect("All")
+)
+
+audit_report_data_types <- data_type_summary %>%
+  select(audit_report_id, report_data_type) %>%
+  distinct() %>%
+  tabyl(report_data_type)
+
+audit_data_types <- data_type_summary %>%
+  select(audit_id, data_type) %>%
+  distinct() %>%
+  tabyl(data_type)
+
+audit_report_data_types
+# audit_data_types
+```
+
+## Section 4.2.2: Impact Ratio Analysis
+
+First, we do some cleaning of impact ratios. There appears to be one audit report that did not report any impact ratios at all -- HiredScore -- even though these are calculable from the underlying numbers reported. For NYU Langone Talent Plus Assessment One, the reference group is less than 2% of the sample, so the impact ratio is not reported. For these results, we use the `impact_calc` variable. 
+
+We see that there are a number of impact ratios below .8 and a number above 1. We quantify this at the audit and audit report levels, as well at the group level: 
+
+- 53% of audits include at least one impact ratio below 4/5
+- 23% of group level results across all audits include an impact ratio below 4/5
+
+```{r section-4-2-2-pt-1}
+# First, we want to limit to results where there is a comparator group (e.g., group with impact ratio of 1), so we 
+# check how many results we lose by doing this filtering. The only ones we lose are the Reejig, NYU Langone, and 
+# HiredScore results that don't report impact ratios. 
+# aedt_df %>%
+#   filter(!any_group_ir_is_one)
+
+impact_ratios_cleaned <- aedt_df %>%
+  # for hackerrank, selection is actually a negative outcome, so we filter out these rows for analysis
+  filter(deploying_entity != "Hackerrank",
+         # Only one audit (Dover) has both `Selection` and `Scoring`. We go with `Selection` for this set of plots.
+         !(tool_vendor == "dover" & selection_or_scoring_rate == "Scoring")) %>%
+  mutate(
+    # for ones that don't report any 
+    # IRs but for which the IRs are calculable, 
+    # use our calculations. otherwise, use reported.
+    # this is the case for: 
+    # hiredscore - no IRs reported
+    # one of the NYU langone results - the reference group is less than 2% of the sample, so the impact ratio is not reported.
+    # some of the reejig results - IRs are not reported
+  impact_ratio_for_analysis = ifelse(!any_group_ir_is_one & is.na(impact_ratio), impact_calc, impact_ratio)) %>%
+  # recreate the any_group_ir_is_one col using impact_ratio_for_analysis
+  group_by(audit_id) %>%
+  mutate(audit_any_ir_below_four_fifths = any(impact_ratio_for_analysis < .8 & number_of_applications != 0, na.rm = T),
+         audit_any_ir_above_one = any(impact_ratio_for_analysis > 1, na.rm = T)) %>%
+  ungroup() %>%
+  group_by(audit_id, selection_or_scoring_rate, protected_char_group) %>% 
+  mutate(any_group_ir_is_one = any(impact_ratio_for_analysis == 1, na.rm = T),
+         any_group_ir_below_four_fifths = any(impact_ratio_for_analysis < .8 & number_of_applications != 0, na.rm = T),
+         group_has_comparator = any(comparator_group)) %>%
+  ungroup()
+
+# check that all group level results now have at least one an IR of 1 
+stopifnot(impact_ratios_cleaned$any_group_ir_is_one)
+
+impact_ratios_cleaned %>%
+  filter(!is.na(impact_ratio_for_analysis)) %>%
+  distinct(audit_id, audit_any_ir_below_four_fifths) %>%
+  tabyl(audit_any_ir_below_four_fifths)
+
+impact_ratios_cleaned %>%
+  filter(!is.na(impact_ratio_for_analysis), group_has_comparator) %>%
+  distinct(audit_id, selection_or_scoring_rate, protected_char_group, any_group_ir_below_four_fifths) %>% 
+  tabyl(any_group_ir_below_four_fifths)
+```
+
+Which groups have impact ratios below .8, and what is the comparator group in those instances? 
+
+NOTE: Sometimes there are multiple comparator groups for a given audit (e.g., if multiple groups happen to have the same selection rate and that's the highest selection rate). In these instances, when analyzing which groups are the comparator when there are impact ratios below .8, we may count each group multiple times, based on the thinking that if multiple groups have an IR of 1 and another group has an IR below .8, then the group with the IR below .8 has a selection/scoring rate that is less than 4/5 of each of the comparator group's selection/scoring rate.
+
+Finding: There are no IRs below .8 for analyses broken down by sex, just for race and ethnicity. 
+
+```{r section-4-2-2-pt-2}
+audit_ids_with_comparator_group <- impact_ratios_cleaned %>%
+  filter(comparator_group) %>%
+  select(audit_id, selection_or_scoring_rate, link_to_result,
+         protected_char_group, comparator_group, sex, race_ethnicity) %>%
+  unite(comparator_group_value, sex, race_ethnicity, sep = " ") %>%
+  mutate(comparator_group_value = as.factor(trimws(str_remove_all(comparator_group_value, "Total")))) %>%
+  select(-comparator_group)
+
+impact_ratios_with_comparators <- impact_ratios_cleaned %>%
+  left_join(audit_ids_with_comparator_group, by = c("audit_id", 
+                                                    "selection_or_scoring_rate",
+                                                    "link_to_result",
+                                                    "protected_char_group")) %>%
+  filter(impact_ratio_for_analysis < .8,
+         number_of_applications != 0,
+         !is.na(impact_ratio_for_analysis),
+         group_has_comparator) %>%
+  unite(ir_below_ff_group, sex, race_ethnicity, sep = " ") %>%
+  mutate(ir_below_ff_group = as.factor(trimws(str_remove_all(ir_below_ff_group, "Total"))))
+
+ir_below_ff_summary_stats <- impact_ratios_with_comparators %>%
+  group_by(protected_char_group, comparator_group_value, ir_below_ff_group) %>%
+  summarise(total_number_of_applications = sum(number_of_applications),
+            n = n()) %>%
+  ungroup()
+
+ir_below_ff_summary_stats %>%
+  count(protected_char_group)
+```
+
+In 41% of instances where there is an IR below .8, the comparator group includes white people (either white men, white women, or white people in total), and the group with an IR below .8 is a non-white group.  
+
+```{r section-4-2-2-pt-3}
+ir_stats <- ir_below_ff_summary_stats %>%
+  arrange(-n) %>%
+  mutate(num_results_cum = cumsum(n),
+         pct_results = n / sum(n),
+         comp_white_ff_nonwhite = grepl("white", comparator_group_value, ignore.case = T) & 
+           !grepl("white", ir_below_ff_group, ignore.case = T))
+
+comp_white_stats <- ir_stats %>% 
+  filter(comp_white_ff_nonwhite) %>%
+  mutate(cum_pct_results = cumsum(pct_results))
+
+sum(comp_white_stats$pct_results)
+```
+
+In the other 59% of instances where there is an IR below .8, the comparator group and group with the selection or scoring rate below four fifths varies: 
+
+```{r section-4-2-2-pt-4}
+ir_stats %>% 
+  filter(!comp_white_ff_nonwhite) %>% 
+  group_by(comparator_group_value) %>%
+  summarise(pct_of_all_results = sum(pct_results)) %>%
+  arrange(-pct_of_all_results)
+```
+
+Sometimes impact ratios are not reported or listed as NA; which groups does this occur for? We see impact ratios are often not reported for applicants who were classified as “Native Hawaiian or Other Pacific Islander” or “American Indian or Alaska Native.”
+
+```{r section-4-2-2-pt-5}
+impact_ratios_cleaned %>%
+  filter(is.na(impact_ratio_for_analysis), 
+         !grepl("Total|Missing", race_ethnicity), 
+         !grepl("Total|Missing", sex)) %>%
+  count(race_ethnicity, sex) %>%
+  arrange(-n)
+```
+
+In some instances, there are IRs above one -- meaning the group with the highest selection rate is not the comparator group. Looking at audits where this is the case, we see that: 
+
+- 54% of audits have at least one IR above one. 
+- Most of these audits are of HireVue tools deployed by either JetBlue, Citizens, Pfizer, or Burlington conducted by DCI Consulting. One other is ZoomInfo's.
+- For audits done by DCI Consulting, the "comparator group" is not always the most-selected group; they provide an explanation in their reports about aggregating data from multiple AEDT deployments to select the comparator group.
+- For the ZoomInfo audit, they appear to define the comparator group as the group with the highest selection rate among the groups that comprise more than 2% of the applicant pool – so when a group smaller than 2% has a higher selection ratio, that impact ratio is > 1.
+
+```{r section-4-2-2-pt-6}
+impact_ratios_cleaned %>%
+  filter(!is.na(impact_ratio_for_analysis)) %>%
+  distinct(audit_id, audit_any_ir_above_one) %>%
+  tabyl(audit_any_ir_above_one)
+```
+
+## Section 4.2.3 Results: Comparing Audits from 2023 to 2024
+
+We find that almost all the 2024 audit reports used the same auditor and data type (historical or test data) as their 2023 predecessors. All data types stayed the same, and auditors were switched auditors between 2023 and 2024 in only one instance.
+
+```{r section-4-2-3}
+multi_year_audit_ids <- aedt_df %>%
+  select(deploying_entity, year_of_audit_result, audit_report_id) %>%
+  filter(year_of_audit_result %in% c(2023, 2024)) %>%
+  group_by(deploying_entity, year_of_audit_result) %>%
+  slice(1) %>% 
+  ungroup() %>% 
+  distinct() %>%
+  get_dupes(deploying_entity) %>%
+  filter(dupe_count == 2) %>%
+  pull(audit_report_id)
+
+compare_data_types <- aedt_df %>% 
+  filter(audit_report_id %in% multi_year_audit_ids) %>%
+  select(deploying_entity, year_of_audit_result, data_type) %>%
+  distinct() %>%
+  pivot_wider(names_from = year_of_audit_result, values_from = data_type) %>%
+  mutate(same_data_type = `2023`==`2024`)
+
+compare_auditors <- aedt_df %>% 
+  filter(audit_report_id %in% multi_year_audit_ids) %>%
+  select(deploying_entity, year_of_audit_result, auditor) %>%
+  distinct() %>%
+  pivot_wider(names_from = year_of_audit_result, values_from = auditor) %>%
+  mutate(same_data_type = `2023`==`2024`)
+
+compare_data_types 
+compare_auditors
+```
+## Section 4.2.4 Results: The Impact of Missing Data
+
+Missingness in metadata (% missing date of first use, etc.) 
+
+- For 86% of audits, we could not identify the date of first use.
+- For 62% of audits, we could not identify the position. 
+
+```{r section-4-2-4-pt-1}
+metadata_cols <- c(
+  "date_of_first_use",
+  "data_type",
+  "audit_data_start_date",
+  "audit_data_end_date",
+  "auditor",
+  "tool_vendor",
+  "position",
+  "tool_id"
+)
+
+metadata_df <- aedt_df %>%
+  select(audit_id, all_of(metadata_cols)) %>%
+  distinct() 
+
+metadata_df %>%
+  summarise(across(all_of(metadata_cols),  ~sum(is.na(.)|grepl("Unknown",., ignore.case = T)))) %>%
+  t() %>%
+  as.data.frame() %>%
+  rename(num_missing_unknown = V1) %>%
+  mutate(pct_missing_unknown = round(num_missing_unknown / nrow(metadata_df), 3)) %>%
+  arrange(-pct_missing_unknown)
+```
+
+### Missing Demographic Data
+
+```{r section-4-2-4-pt-2}
+# SETUP 
+dir_figs <- here::here("figures/")
+
+theme_bounds_plots <- 
+  theme_cowplot() +
+  theme(
+    axis.ticks.x = element_blank(), axis.text.x = element_blank(),
+    plot.title = element_text(size = 10),
+    )
+
+filter_message <- function(.data, ..., msg = NULL) {
+  message(msg)
+  tidylog::filter(.data, ...)
+}
+
+prep_plot_data <- function(
+    aedt_df_pmb,
+    # Omitting missing/unknown and total
+    sex = ordered(c("Female", "Male")),
+    # Omitting missing/unknown and total
+    race_eth = 
+      ordered(
+        c("American Indian or Alaska Native", "Asian", "Black or African American", 
+          "Hispanic or Latino", "Native Hawaiian or Other Pacific Islander", "Two or More Races", 
+          "White")),
+    filter_conditions = NULL) {
+  
+  out <- 
+    aedt_df_pmb %>% 
+    filter_message(sex %in% {{sex}}, msg = "Filtering data to selected sex categories\n")
+  out <- 
+    out %>% 
+    filter_message(race_ethnicity %in% {{race_eth}}, msg = "Filtering data to selected race/ethnicity categories\n") 
+  out <- 
+    out %>% 
+    filter_message(!is.na(impact_ratio), msg = "Filtering data to non-missing impact ratio\n")
+  
+  out <- 
+    out %>% 
+    filter_message(!!!filter_conditions, msg = "Filtering data by custom conditions\n")
+  
+  return(out)
+}
+```
+
+More than 75% (specifically 83%) of audits in the sample reported that their audits were missing race and/or sex information for some applicants evaluated by the AEDT. The other audits generally used test data or did not clearly report how many applicants were missing demographic information. 
+
+```{r section-4-2-4-pt-3}
+aedt_df %>%
+  filter(race_ethnicity == "Missing/Unknown" | sex == "Missing/Unknown") %>%
+  group_by(audit_id) %>%
+  summarize(missing_demographic_data = any(number_of_applications > 0)) %>%
+  count(missing_demographic_data) %>%
+  mutate(pct = n / sum(n))
+```
+
+### Filter to one selection/scoring rate per audit
+
+Some audits present results for multiple rates. For now, we will take just one set of results. All audits that have `Selection, top` also have `Selection, top and middle`, and vice versa.
+We'll use the former for now. Only one audit (Dover) has both `Selection` and `Scoring`. We go with `Selection` for this set of plots.
+
+```{r section-4-2-4-pt-4}
+multiple_rates <- 
+  aedt_df %>% 
+  summarize(
+    uniq_rates = length(unique(selection_or_scoring_rate)),
+    has_top = any(selection_or_scoring_rate == "Selection, top"),
+    has_top_middle = any(selection_or_scoring_rate == "Selection, top and middle"),
+    # rates = list(unique(selection_or_scoring_rate)),
+    .by = audit_id
+  ) %>% 
+  filter(uniq_rates > 1)
+
+summary(multiple_rates)
+
+filter(aedt_df, audit_id == "staya_inc_dover_varun_ganesan_2023_audit_1")$selection_or_scoring_rate %>% 
+  unique()
+
+aedt_df_pmb <- 
+  aedt_df %>% 
+  filter(
+    ! audit_id %in% multiple_rates$audit_id | selection_or_scoring_rate %in% c("Selection", "Selection, top")
+  )
+```
+
+### Construct dataset for plotting
+
+Separately prep the data for 3 types of plots: 
+
+1) Sex characteristics alone
+2) Race-ethnicity characteristics alone
+3) Intersectional
+
+```{r section-4-2-4-pt-5}
+plot_data_list <- 
+  list(
+    sex = aedt_df_pmb %>% prep_plot_data(race_eth = "Total"),
+    race = aedt_df_pmb %>% prep_plot_data(sex = "Total"),
+    inter = aedt_df_pmb %>% filter(protected_char_group == "intersectional") %>% prep_plot_data()
+  )
+
+plot_data_list$combined <- 
+  bind_rows(
+        plot_data_list$sex %>% rename(group = sex),
+        plot_data_list$race %>% rename(group = race_ethnicity)
+      ) %>% 
+      mutate(
+        group = 
+          factor(
+            group,
+            levels = 
+              c("Female", "Male", 
+                "American Indian or Alaska Native", "Asian", 
+                "Black or African American", "Hispanic or Latino", 
+                "Native Hawaiian or Other Pacific Islander", "Two or More Races",
+                "White")
+          )
+      )
+```
+
+How often is the IR lower bound below .8 under each assumption? 
+
+```{r section-4-2-4-pt-24}
+# first option
+option_1_pct <- mean(aedt_df_pmb$impact_ratio_lower_bound < 0.8, na.rm = TRUE)
+
+# second option
+option_2_pct <- mean(aedt_df_pmb$impact_ratio_lower_bound2 < 0.8, na.rm = TRUE)
+
+option_1_pct
+option_2_pct
+```
+
+### Plots {.tabset}
+
+#### Selection / scoring rate {.tabset}
+
+```{r section-4-2-4-pt-6}
+plot_bounds_result <- function(.x) {
+  .x %>% 
+    mutate(
+      result_id = paste(audit_id, sex, race_ethnicity) %>% reorder(result)
+    ) %>% 
+    ggplot() +
+    aes(
+      y = result,
+      ymin = result_lower_bound,
+      ymax = result_upper_bound,
+      x = result_id
+    ) +
+    geom_pointrange(linewidth = 0.1, size = 0.01)
+  
+}
+```
+
+
+##### Sex
+```{r section-4-2-4-pt-7, fig.height = fig_ht_sex}
+p_brs <- 
+  plot_data_list$sex %>% 
+  plot_bounds_result() +
+  facet_wrap(c("sex"), scales = "free") +
+  theme_bounds_plots +
+  labs(y = "Selection or Scoring Rate", x = "")
+
+p_brs
+
+ggsave(plot = p_brs, here::here(dir_figs, "bounds_result_sex.pdf"), height = fig_ht_sex)
+```
+
+##### Race / ethnicity
+
+```{r section-4-2-4-pt-8, fig.height = fig_ht_race}
+p_brr <- 
+  plot_data_list$race %>% 
+  plot_bounds_result() +
+  
+  
+  facet_wrap(c("race_ethnicity"), scales = "free") +
+  theme_bounds_plots +
+  labs(y = "Selection or Scoring Rate", x = "")
+
+p_brr
+
+ggsave(plot = p_brr, here::here(dir_figs, "bounds_result_race.pdf"), height = fig_ht_race)
+```
+
+
+##### Combined
+
+```{r section-4-2-4-pt-9}
+p_brs_pieces <- 
+  plot_data_list$sex %>%  
+  split(., .$sex) %>% 
+  imap(
+    \(x, y) 
+    plot_bounds_result(x) + theme_bounds_plots +
+      labs(x = "", y = "", title = y)
+    )
+
+p_brr_pieces <- 
+  plot_data_list$race %>%  
+  split(., .$race_ethnicity) %>% 
+  imap(
+    \(x, y) 
+    plot_bounds_result(x) + theme_bounds_plots +
+      labs(x = "", y = "", title = y)
+    )
+```
+
+
+```{r section-4-2-4-pt-10}
+x_r <- 
+  ggdraw() + 
+  draw_label(
+    "Audit Identifier",
+    fontface = "bold",
+    x = 0,
+    hjust = 0
+  ) +
+  theme(
+    plot.margin = margin(l = 300, b = 20)
+  )
+
+y_r <- 
+  ggdraw() +
+  draw_label(
+    "Selection or scooring rate",
+    fontface = "bold",
+    # x = 0, y = 0.5,  hjust = 0, vjust = 0,
+    angle = 90
+    )
+
+
+p_br_grid <- 
+  plot_grid(
+    plotlist = c(p_brs_pieces, p_brr_pieces)
+  ) %>% 
+  plot_grid(x_r, ncol = 1, rel_heights = c(1, 0.05)) %>% 
+  plot_grid(y_r, ., nrow = 1, rel_widths = c(0.05, 1))
+
+
+
+p_br_grid
+
+ggsave(plot = p_br_grid, here::here(dir_figs, "bounds_result_combined.pdf"), height = fig_ht_race)
+```
+
+##### Intersectional
+
+```{r section-4-2-4-pt-11}
+p_bri <- 
+  plot_data_list$inter %>% 
+  plot_bounds_result() +
+  
+  facet_wrap(c("sex", "race_ethnicity")) +
+  theme_bounds_plots +
+  labs(y = "Selection or scoring rate", x = "")
+
+p_bri
+```
+
+
+#### Impact Ratio {.tabset}
+
+```{r section-4-2-4-pt-12}
+plot_bounds_impactratio <- function(.x) {
+  .x %>% 
+    mutate(
+      result_id = paste(audit_id, sex, race_ethnicity) %>% reorder(impact_ratio)
+    ) %>% 
+    ggplot() +
+    aes(
+      y = as.double(impact_ratio),
+      ymin = impact_ratio_lower_bound,
+      ymax = impact_ratio_upper_bound,
+      x = result_id
+    ) +
+    geom_pointrange(linewidth = 0.1, size = 0.01) +
+    geom_hline(aes(yintercept = 0.8), color = "red") +
+    scale_y_continuous(
+      breaks = 0:5,
+      labels = scales::label_number(accuracy = 1)
+      ) +
+    coord_cartesian(y = c(0, 4))
+}
+```
+
+
+##### Sex
+```{r section-4-2-4-pt-13, fig.height = fig_ht_sex}
+p_bis <- 
+  plot_data_list$sex %>% 
+  plot_bounds_impactratio() +
+  
+  facet_wrap(c("sex"), scales = "free") +
+  theme_bounds_plots + 
+  labs(y = "Impact Ratio", x = "")
+
+p_bis
+
+ggsave(plot = p_bis, here::here(dir_figs, "bounds_ir_sex.pdf"), height = fig_ht_sex)
+```
+
+##### Race / ethnicity
+
+```{r section-4-2-4-pt-14, fig.height = fig_ht_race}
+p_bir <- 
+  plot_data_list$race %>% 
+  plot_bounds_impactratio() +
+  
+  facet_wrap(c("race_ethnicity"), scales = "free") +
+  theme_bounds_plots + 
+  labs(y = "Impact Ratio", x = "")
+
+p_bir
+
+ggsave(plot = p_bir, here::here(dir_figs, "bounds_ir_race.pdf"), height = fig_ht_race)
+```
+
+
+##### Combined
+
+```{r section-4-2-4-pt-15}
+p_bis_pieces <- 
+  plot_data_list$sex %>%  
+  split(., .$sex) %>% 
+  imap(
+    \(x, y) 
+    plot_bounds_impactratio(x) + theme_bounds_plots +
+      labs(x = "", y = "", title = y)
+    )
+
+p_bir_pieces <- 
+  plot_data_list$race %>%  
+  split(., .$race_ethnicity) %>% 
+  imap(
+    \(x, y) 
+    plot_bounds_impactratio(x) + theme_bounds_plots +
+      labs(x = "", y = "", title = y)
+    )
+```
+
+```{r section-4-2-4-pt-16}
+p_bir_nhpi <-
+  p_bir_pieces$`Native Hawaiian or Other Pacific Islander` +
+  geom_point(size = 3) +
+  labs(title = "", x = "Audit Identifier", y = "Impact Ratio") +
+  theme(axis.title = element_text(size = 20), axis.text = element_text(size = 20))
+
+ggsave(plot = p_bir_nhpi, here::here(dir_figs, "bounds_ir_nhpi.pdf"), width = 10)
+```
+
+
+
+```{r section-4-2-4-pt-17}
+x_ir <- 
+  ggdraw() + 
+  draw_label(
+    "Audit Identifier",
+    fontface = "bold",
+    x = 0,
+    hjust = 0
+  ) +
+  theme(
+    plot.margin = margin(l = 300, b = 20)
+  )
+
+y_ir <- 
+  ggdraw() +
+  draw_label(
+    "Impact Ratio",
+    fontface = "bold",
+    # x = 0, y = 0.5,  hjust = 0, vjust = 0,
+    angle = 90
+    )
+
+p_bi_grid <- 
+  plot_grid(
+    plotlist = c(p_bis_pieces, p_bir_pieces)
+  ) %>% 
+  plot_grid(x_ir, ncol = 1, rel_heights = c(1, 0.05)) %>% 
+  plot_grid(y_ir, ., nrow = 1, rel_widths = c(0.05, 1))
+
+p_bi_grid
+
+ggsave(plot = p_bi_grid, here::here(dir_figs, "bounds_ir_combined.pdf"), height = fig_ht_race)
+```
+
+
+#### Impact Ratio 2 {.tabset}
+
+Remake the plots using the alternative impact ratio bounds calculation.
+Here we assume that the demographic distribution in the missing data is identical to distribution in the observed data.
+
+```{r section-4-2-4-pt-18}
+plot_bounds_impactratio2 <- function(.x) {
+  .x %>% 
+    mutate(
+      result_id = paste(audit_id, sex, race_ethnicity) %>% reorder(impact_ratio)
+    ) %>% 
+    ggplot() +
+    aes(
+      y = as.double(impact_ratio),
+      ymin = impact_ratio_lower_bound2,
+      ymax = impact_ratio_upper_bound2,
+      x = result_id
+    ) +
+    geom_pointrange(linewidth = 0.1, size = 0.01) +
+    geom_hline(aes(yintercept = 0.8), color = "red") +
+    scale_y_continuous(
+      breaks = 0:5,
+      labels = scales::label_number(accuracy = 1)
+      ) +
+    coord_cartesian(y = c(0, 4))
+}
+```
+
+
+##### Sex
+```{r section-4-2-4-pt-19, fig.height = fig_ht_sex}
+p_bis_2 <- 
+  plot_data_list$sex %>% 
+  plot_bounds_impactratio2() +
+  
+  facet_wrap(c("sex"), scales = "free") +
+  theme_bounds_plots + 
+  labs(y = "Impact Ratio", x = "")
+
+p_bis_2
+
+ggsave(plot = p_bis_2, here::here(dir_figs, "bounds_ir_sex_opt_2.pdf"), height = fig_ht_sex)
+```
+
+##### Race / ethnicity
+
+```{r section-4-2-4-pt-20, fig.height = fig_ht_race}
+p_bir_2 <- 
+  plot_data_list$race %>% 
+  plot_bounds_impactratio2() +
+  
+  facet_wrap(c("race_ethnicity"), scales = "free") +
+  theme_bounds_plots + 
+  labs(y = "Impact Ratio", x = "")
+
+p_bir_2
+
+ggsave(plot = p_bir_2, here::here(dir_figs, "bounds_ir_race_opt_2.pdf"), height = fig_ht_race)
+```
+
+
+##### Combined
+
+```{r section-4-2-4-pt-21}
+p_bis_pieces_2 <- 
+  plot_data_list$sex %>%  
+  split(., .$sex) %>% 
+  imap(
+    \(x, y) 
+    plot_bounds_impactratio2(x) + theme_bounds_plots +
+      labs(x = "", y = "", title = y)
+    )
+
+p_bir_pieces_2 <- 
+  plot_data_list$race %>%  
+  split(., .$race_ethnicity) %>% 
+  imap(
+    \(x, y) 
+    plot_bounds_impactratio2(x) + theme_bounds_plots +
+      labs(x = "", y = "", title = y)
+    )
+```
+
+```{r section-4-2-4-pt-22}
+p_bir_nhpi_2 <-
+  p_bir_pieces_2$`Native Hawaiian or Other Pacific Islander` +
+  geom_point(size = 3) +
+  labs(title = "", x = "Audit Identifier", y = "Impact Ratio") +
+  theme(axis.title = element_text(size = 20), axis.text = element_text(size = 20))
+
+ggsave(plot = p_bir_nhpi_2, here::here(dir_figs, "bounds_ir_nhpi_opt_2.pdf"), width = 10)
+```
+
+
+```{r section-4-2-4-pt-23}
+p_bi_grid_2 <- 
+  plot_grid(
+    plotlist = c(p_bis_pieces_2, p_bir_pieces_2)
+  ) %>% 
+  plot_grid(x_ir, ncol = 1, rel_heights = c(1, 0.05)) %>% 
+  plot_grid(y_ir, ., nrow = 1, rel_widths = c(0.05, 1))
+
+p_bi_grid_2
+
+ggsave(plot = p_bi_grid_2, here::here(dir_figs, "bounds_ir_combined_opt_2.pdf"), height = fig_ht_race)
+```
+
+
+

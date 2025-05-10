@@ -1,0 +1,169 @@
+---
+title: "Bias Audit Table Extraction Template"
+output:
+  html_document: 
+    toc: true
+    toc_depth: 2
+    code_folding: hide
+    theme: cosmo
+    highlight: tango
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+source(here::here("code/helpers.R"))
+
+# suppress read-in messages
+read_csv <- purrr::partial(readr::read_csv, show_col_types = FALSE)
+
+options(knitr.duplicate.label = "allow")
+```
+
+Audit from [here]().
+```{r}
+# tag for dynamic file paths
+tag <- ""
+```
+
+```{r extraction, eval = !file.exists(glue_here("audits/interim_data/{tag}_raw.rds"))}
+dir_audit <- here::here("audits/pdfs", tag)
+
+# call the helper function
+# extracted_dfs <- extract_tables_from_audit(
+#   # reading from audits/pdfs/
+#   audit_path = list.files(dir_audit, full.names = TRUE),
+#   table_pg_numbers = c(1)
+# )
+
+# save results as RDS in interim folder so you don't have to reselect the tables if you re-run
+write_rds(
+  extracted_dfs,
+  glue_here("audits/interim_data/{tag}_raw.rds")
+)
+```
+
+Read data and clean column names.
+```{r clean-names}
+# load interim saved data 
+raw_fn <- 
+  list.files(here::here("audits/interim_data"), 
+             pattern = tag, full.names = TRUE)
+raw_list <- lapply(raw_fn, read_csv)
+names(raw_list) <- str_extract(raw_fn, "[a-z-]+(?=.csv)")
+
+# fix column names
+tbl_sex <- 
+  raw_list[["sex"]] %>% 
+  transmute(
+    number_of_applications = ,
+    n_selected_or_n_above_median = ,
+    result = ,
+    impact_ratio = ,
+    protected_char_group = "gender",
+    race_ethnicity = "total",
+    sex =  
+  )
+
+tbl_race <- 
+  raw_list[["race"]] %>% 
+  transmute(
+    number_of_applications = ,
+    n_selected_or_n_above_median = ,
+    result = ,
+    impact_ratio = ,
+    protected_char_group = "race",
+    race_ethnicity = ,
+    sex = "total"
+  )
+
+tbl_sexrace <- 
+  raw_list[["sex-race"]] %>% 
+  transmute(
+    number_of_applications = ,
+    n_selected_or_n_above_median = ,
+    result = ,
+    impact_ratio = ,
+    protected_char_group = "intersectional",
+    race_ethnicity = ,
+    sex =  
+  )
+```
+
+Clean column values.
+```{r clean-values}
+tbl_full <- 
+  bind_rows(
+    tbl_sex, tbl_race, tbl_sexrace
+  ) %>% 
+  mutate(
+    
+    result = as.numeric(str_remove(result, "%")) / 100,
+    
+  ) %>% 
+  
+  # one of the parties may have used some algorithm to impute
+  # missing and unknown demographic data; if so, manually enter
+  # relevant values here
+  add_row(
+    sex = "Missing/Unknown", 
+    race_ethnicity = "total", 
+    number_of_applications = ,
+    
+    n_selected_or_n_above_median = NA, 
+    result = NA, 
+    impact_ratio = NA,
+    protected_char_group = "gender"
+  ) %>%
+  add_row(
+    sex = "total", 
+    race_ethnicity = "Missing/Unknown", 
+    number_of_applications = ,
+    
+    n_selected_or_n_above_median = NA, 
+    result = NA, 
+    impact_ratio = NA,
+    protected_char_group = "race/ethnicity"
+  ) %>%
+  add_row(
+    sex = "Missing/Unknown", 
+    race_ethnicity = "Missing/Unknown", 
+    number_of_applications = ,
+    
+    n_selected_or_n_above_median = NA,
+    result = NA, 
+    impact_ratio = NA,
+    protected_char_group = "intersectional"
+  ) %>% 
+  
+  mutate(
+    deploying_entity = "",
+    tool_id = "",
+    tool_vendor = "",
+    data_type = "",
+    auditor = "",
+    position = "",
+    # selection or scoring
+    type_of_tool = "",
+    selection_or_scoring_rate = "",
+    audit_data_start_date = "",
+    audit_data_end_date = "",
+    date_of_first_use = "",
+    year_of_audit_result = ,
+    link_to_result = ""
+  ) 
+```
+
+
+```{r write}
+# make a folder to save the outputs - we want one folder per audit because 
+# we might have multiple csvs per audit, so we can put all the 
+# csvs for the same audit in that folder
+
+deploying_entity <- str_remove(tag, '_.+$')
+out_dir <- glue_here("audits/extracted_tables/{deploying_entity}")
+
+if (!dir.exists(out_dir)) dir.create(out_dir)
+
+write_csv(tbl_full, glue_here(out_dir, "{tag}.csv"))
+```
+
